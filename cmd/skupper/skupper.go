@@ -766,13 +766,21 @@ func ensureCA(name string, owner *metav1.OwnerReference, kube *KubeDetails) *cor
 	return nil
 }
 
-func ensureService(name string, ports []corev1.ServicePort, owner *metav1.OwnerReference, servingCert string, serviceType string, kube *KubeDetails) (*corev1.Service, error) {
+func ensureServiceForRouter(name string, ports []corev1.ServicePort, owner *metav1.OwnerReference, servingCert string, serviceType string, kube *KubeDetails) (*corev1.Service, error) {
+	return ensureServiceForComponent(name, "router", ports, owner, servingCert, serviceType, kube)
+}
+
+func ensureServiceForController(name string, ports []corev1.ServicePort, owner *metav1.OwnerReference, servingCert string, serviceType string, kube *KubeDetails) (*corev1.Service, error) {
+	return ensureServiceForComponent(name, "proxy-controller", ports, owner, servingCert, serviceType, kube)
+}
+
+func ensureServiceForComponent(name string, component string, ports []corev1.ServicePort, owner *metav1.OwnerReference, servingCert string, serviceType string, kube *KubeDetails) (*corev1.Service, error) {
 	current, err :=kube.Standard.CoreV1().Services(kube.Namespace).Get(name, metav1.GetOptions{})
 	if err == nil  {
 		fmt.Println("Service", name, "already exists")
 		return current, nil
 	} else if errors.IsNotFound(err) {
-		labels := getLabels("router")
+		labels := getLabels(component)
 		service := &corev1.Service{
 			TypeMeta: metav1.TypeMeta{
 				APIVersion: "v1",
@@ -963,7 +971,7 @@ func ensureEditRole(router *appsv1.Deployment, kube *KubeDetails) *rbacv1.Role {
 			{
 				Verbs:     []string{"get", "list", "watch", "create", "update", "delete"},
 				APIGroups: []string{""},
-				Resources: []string{"services", "configmaps"},
+				Resources: []string{"services", "configmaps", "pods"},
 			},
 			{
 				Verbs:     []string{"get", "list", "watch", "create", "update", "delete"},
@@ -1042,7 +1050,7 @@ func initCommon(router *Router, volumes []string, kube *KubeDetails) *appsv1.Dep
 	ensureRoleBinding("skupper", "skupper-view", dep, kube)
 
 
-	ensureService("skupper-messaging", messagingServicePorts(), &owner, "", "", kube)
+	ensureServiceForRouter("skupper-messaging", messagingServicePorts(), &owner, "", "", kube)
 	if router.Console != "" {
 		servingCerts := ""
 		termination := routev1.TLSTerminationEdge
@@ -1066,12 +1074,28 @@ func initCommon(router *Router, volumes []string, kube *KubeDetails) *appsv1.Dep
 			ensureSaslConfig(&owner, kube)
 			ensureSaslUsers(router.ConsoleUser, router.ConsolePassword, &owner, kube)
 		}
-		ensureService("skupper-console", []corev1.ServicePort{
+		ensureServiceForRouter("skupper-console", []corev1.ServicePort{
 			port,
 		}, &owner, servingCerts, "", kube)
 		if kube.Routes != nil {
 			ensureRoute("skupper-console", "skupper-console", "console", termination, &owner, kube)
 		} //else ??TODO?? create ingress
+	}
+
+	metricsPort := []corev1.ServicePort{
+		corev1.ServicePort{
+			Name:       "metrics",
+			Protocol:   "TCP",
+			Port:       8080,
+			TargetPort: intstr.FromInt(8080),
+		},
+	}
+	//TODO: make this configurable and secure
+	if kube.Routes != nil {
+		ensureServiceForController("skupper-controller", metricsPort, &owner, "", "", kube)
+		ensureRoute("skupper-controller", "skupper-controller", "metrics", routev1.TLSTerminationEdge, &owner, kube)
+	} else {
+		ensureServiceForController("skupper-internal", metricsPort, &owner, "", "LoadBalancer", kube)
 	}
 
 	return dep
@@ -1093,16 +1117,16 @@ func initInterior(router *Router, kube *KubeDetails, clusterLocal bool) *appsv1.
 	owner := get_owner_reference(dep)
 	internalCa := ensureCA("skupper-internal-ca", &owner, kube)
 	if clusterLocal {
-		ensureService("skupper-internal", internalServicePorts(), &owner, "", "", kube)
+		ensureServiceForRouter("skupper-internal", internalServicePorts(), &owner, "", "", kube)
 		generateSecret(internalCa, "skupper-internal", "skupper-internal", "skupper-internal." + kube.Namespace, false, &owner, kube)
 	} else if kube.Routes != nil {
-		ensureService("skupper-internal", internalServicePorts(), &owner, "", "", kube)
+		ensureServiceForRouter("skupper-internal", internalServicePorts(), &owner, "", "", kube)
 		//TODO: handle loadbalancer service where routes are not available
 		hosts := ensureRoute("skupper-inter-router", "skupper-internal", "inter-router", routev1.TLSTerminationPassthrough, &owner, kube)
 		hosts += "," + ensureRoute("skupper-edge", "skupper-internal", "edge", routev1.TLSTerminationPassthrough, &owner, kube)
 		generateSecret(internalCa, "skupper-internal", router.Name, hosts, false, &owner, kube)
 	} else {
-		service, err := ensureService("skupper-internal", internalServicePorts(), &owner, "", "LoadBalancer", kube)
+		service, err := ensureServiceForRouter("skupper-internal", internalServicePorts(), &owner, "", "LoadBalancer", kube)
 		if err == nil {
 			host := getLoadBalancerHostOrIp(service)
 			for i := 0; host == "" && i < 120; i++ {
@@ -2278,8 +2302,7 @@ func main() {
 			fmt.Println("Skupper is now installed in namespace '" + kube.Namespace + "'.  Use 'skupper status' to get more information.")
 		},
 	}
-        // Recommend --site-name - I find just a naked "id" or "name" too context free and unhelpful
-	cmdInit.Flags().StringVarP(&skupperName, "id", "", "", "Provide a specific identity for the skupper installation")
+	cmdInit.Flags().StringVarP(&skupperName, "site-name", "", "", "Provide a specific name for this skupper installation")
 	cmdInit.Flags().BoolVarP(&isEdge, "edge", "", false, "Configure as an edge")
 	cmdInit.Flags().BoolVarP(&enableProxyController, "enable-proxy-controller", "", true, "Setup the proxy controller as well as the router")
 	cmdInit.Flags().BoolVarP(&enableServiceSync, "enable-service-sync", "", true, "Configure proxy controller to particiapte in service sync (not relevant if --enable-proxy-controller is false)")
