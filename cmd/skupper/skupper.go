@@ -95,6 +95,7 @@ func routerConfig(router *Router) string {
 router {
     mode: {{.Mode}}
     id: {{.Name}}-${HOSTNAME}
+    metadata: ${SKUPPER_SITE_ID}
 }
 
 listener {
@@ -503,6 +504,18 @@ func routerEnv(router *Router) []corev1.EnvVar {
 		envVars = append(envVars, corev1.EnvVar{Name: "QDROUTERD_AUTO_MESH_DISCOVERY", Value: "QUERY"})
 	}
 	envVars = append(envVars, corev1.EnvVar{Name: "QDROUTERD_CONF", Value: routerConfig(router)})
+	envVars = append(envVars, corev1.EnvVar{
+		Name: "SKUPPER_SITE_ID",
+		ValueFrom: &corev1.EnvVarSource {
+			ConfigMapKeyRef: &corev1.ConfigMapKeySelector {
+				LocalObjectReference: corev1.LocalObjectReference {
+					"skupper-site",
+				},
+				Key: "id",
+			},
+		},
+	})
+
 	if router.Console == ConsoleAuthModeInternal {
 		envVars = append(envVars, corev1.EnvVar{Name: "QDROUTERD_AUTO_CREATE_SASLDB_SOURCE", Value: "/etc/qpid-dispatch/sasl-users/"})
 		envVars = append(envVars, corev1.EnvVar{Name: "QDROUTERD_AUTO_CREATE_SASLDB_PATH", Value: "/tmp/qdrouterd.sasldb"})
@@ -550,7 +563,7 @@ func getLabels(component string) map[string]string{
 	}
 }
 
-func RouterDeployment(router *Router, namespace string) *appsv1.Deployment {
+func RouterDeployment(router *Router, owner *metav1.OwnerReference, namespace string) *appsv1.Deployment {
 	labels := getLabels("router")
 
 	dep := &appsv1.Deployment{
@@ -581,6 +594,11 @@ func RouterDeployment(router *Router, namespace string) *appsv1.Deployment {
 				},
 			},
 		},
+	}
+	if owner != nil {
+		dep.ObjectMeta.OwnerReferences = []metav1.OwnerReference{
+			*owner,
+		}
 	}
 
 	if router.Console == ConsoleAuthModeOpenshift {
@@ -700,10 +718,16 @@ func ensureProxyController(enableServiceSync bool, router *appsv1.Deployment, ku
 			},
 		}
 		if enableServiceSync {
-			origin := randomId(10)
 			dep.Spec.Template.Spec.Containers[0].Env = append(dep.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
 				Name: "SKUPPER_SERVICE_SYNC_ORIGIN",
-				Value: origin,
+				ValueFrom: &corev1.EnvVarSource {
+					ConfigMapKeyRef: &corev1.ConfigMapKeySelector {
+						LocalObjectReference: corev1.LocalObjectReference {
+							"skupper-site",
+						},
+						Key: "id",
+					},
+				},
 			})
 			mountSecretVolume("skupper", "/etc/messaging/", 0, dep)
 		}
@@ -717,7 +741,7 @@ func ensureProxyController(enableServiceSync bool, router *appsv1.Deployment, ku
 	}
 }
 
-func ensureRouterDeployment(router *Router, volumes []string, kube *KubeDetails) *appsv1.Deployment {
+func ensureRouterDeployment(router *Router, volumes []string, owner *metav1.OwnerReference, kube *KubeDetails) *appsv1.Deployment {
 	deployments:= kube.Standard.AppsV1().Deployments(kube.Namespace)
 	existing, err :=  deployments.Get("skupper-router", metav1.GetOptions{})
 	if err == nil  {
@@ -725,7 +749,7 @@ func ensureRouterDeployment(router *Router, volumes []string, kube *KubeDetails)
 		fmt.Println("Router deployment already exists")
 		return existing
 	} else if errors.IsNotFound(err) {
-		routerDeployment := RouterDeployment(router, kube.Namespace)
+		routerDeployment := RouterDeployment(router, owner, kube.Namespace)
 		for _, v := range volumes {
 			mountRouterTLSVolume(v, routerDeployment)
 		}
@@ -1025,6 +1049,16 @@ func ensureRoleBinding(serviceaccount string, role string, router *appsv1.Deploy
 	}
 }
 
+func get_owner_reference_cm(config *corev1.ConfigMap) metav1.OwnerReference {
+	return metav1.OwnerReference{
+		APIVersion: "core/v1",
+		Kind:       "ConfigMap",
+		Name:       config.ObjectMeta.Name,
+		UID:        config.ObjectMeta.UID,
+	}
+
+}
+
 func get_owner_reference(dep *appsv1.Deployment) metav1.OwnerReference {
 	return metav1.OwnerReference{
 		APIVersion: "apps/v1",
@@ -1039,8 +1073,13 @@ func initCommon(router *Router, volumes []string, kube *KubeDetails) *appsv1.Dep
 	if router.Name == "" {
 		router.Name = kube.Namespace
 	}
-	dep := ensureRouterDeployment(router, volumes, kube)
-	owner := get_owner_reference(dep)
+	siteconfig, err := ensureSkupperConfig(router, kube)
+	if err != nil {
+		log.Fatal("Could not initialise skupper site")
+		return nil
+	}
+	owner := get_owner_reference_cm(siteconfig)
+	dep := ensureRouterDeployment(router, volumes, &owner, kube)
 
 	ca := ensureCA("skupper-ca", &owner, kube)
 	generateSecret(ca, "skupper-amqps", "skupper-messaging", "skupper-messaging,skupper-messaging." + kube.Namespace + ".svc.cluster.local", false, &owner, kube)
@@ -1161,17 +1200,6 @@ func deleteSecret(name string, kube *KubeDetails) {
 		fmt.Println("Secret", name, "does not exist")
 	} else {
 		fmt.Println("Failed to delete secret", name, ": ", err.Error())
-	}
-}
-
-func deleteSkupper(kube *KubeDetails) {
-	err := kube.Standard.AppsV1().Deployments(kube.Namespace).Delete("skupper-router", &metav1.DeleteOptions{})
-	if err == nil  {
-		fmt.Println("Skupper is now removed from '" + kube.Namespace + "'.")
-	} else if errors.IsNotFound(err) {
-		fmt.Println("Skupper is not installed in '" + kube.Namespace + "'.")
-	} else {
-		fmt.Println("Error while trying to delete:", err.Error())
 	}
 }
 
@@ -1635,6 +1663,58 @@ func generateConnectSecret(subject string, secretFile string, kube *KubeDetails)
 		fmt.Println("Router deployment does not exist (need init?): " + err.Error())
 	} else {
 		fmt.Println("Error retrieving router deployment: " + err.Error())
+	}
+}
+
+func deleteSkupper(kube *KubeDetails) {
+	err := kube.Standard.CoreV1().ConfigMaps(kube.Namespace).Delete("skupper-site", &metav1.DeleteOptions{})
+	if err == nil  {
+		fmt.Println("Skupper is now removed from '" + kube.Namespace + "'.")
+	} else if errors.IsNotFound(err) {
+		err := kube.Standard.AppsV1().Deployments(kube.Namespace).Delete("skupper-router", &metav1.DeleteOptions{})
+		if err == nil  {
+			fmt.Println("Skupper is now removed from '" + kube.Namespace + "'.")
+		} else if errors.IsNotFound(err) {
+			fmt.Println("Skupper not installed in '" + kube.Namespace + "'.")
+		} else {
+			fmt.Println("Error while trying to delete:", err.Error())
+		}
+	} else {
+		fmt.Println("Error while trying to delete:", err.Error())
+	}
+}
+
+func ensureSkupperConfig(router *Router, kube *KubeDetails) (*corev1.ConfigMap, error) {
+	config, err := kube.Standard.CoreV1().ConfigMaps(kube.Namespace).Get("skupper-site", metav1.GetOptions{})
+	if err != nil  {
+		if errors.IsNotFound(err) {
+			siteid := randomId(10)
+			configMap := corev1.ConfigMap{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: "v1",
+					Kind:       "ConfigMap",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "skupper-site",
+				},
+				Data: map[string]string{
+					"id": siteid,
+					"name": router.Name,
+				},
+			}
+			created, err := kube.Standard.CoreV1().ConfigMaps(kube.Namespace).Create(&configMap)
+			if err != nil {
+				log.Fatal("Failed to create skupper-site config map: ", err.Error())
+				return nil, err
+			} else {
+				return created, nil
+			}
+		} else {
+			log.Fatal("Failed to retrieve skupper-site config: %s", err)
+			return nil, err
+		}
+	} else {
+		return config, nil
 	}
 }
 
