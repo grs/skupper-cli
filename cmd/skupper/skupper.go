@@ -1755,11 +1755,13 @@ func exposeTarget() func(*cobra.Command,[]string) error {
 }
 
 type ExposeOptions struct {
-	Protocol       string
-	Address        string
-	Port           int
-	TargetPort     int
-	Headless       bool
+	Protocol      string
+	Address       string
+	Port          int
+	TargetPort    int
+	Headless      bool
+	Multicast     bool
+	Aggregate     bool
 }
 
 type Service struct {
@@ -1767,6 +1769,8 @@ type Service struct {
 	Protocol       string `json:"protocol"`
 	Port           int    `json:"port"`
 	Headless       *Headless `json:"headless,omitempty"`
+	Multicast      bool `json:"multicast,omitempty"`
+	Aggregate      bool `json:"aggregate,omitempty"`
 	Targets        []ServiceTarget `json:"targets,omitempty"`
 }
 
@@ -1811,6 +1815,12 @@ func updateServiceDefinition(serviceName string, targetName string, selector str
 					serviceTarget,
 				},
 			}
+			if options.Multicast {
+				serviceDef.Multicast = true
+				if options.Aggregate {
+					serviceDef.Aggregate = true
+				}
+			}
 			encoded, err := jsonencoding.Marshal(serviceDef)
 			if err != nil {
 				fmt.Printf("Failed to create json for service definition: %s", err)
@@ -1828,6 +1838,10 @@ func updateServiceDefinition(serviceName string, targetName string, selector str
 				return
 			} else if service.Headless != nil {
 				fmt.Printf("Service %s already defined as headless. To allow target use skupper unexpose.", serviceName)
+				fmt.Println()
+				return
+			} else if !service.Multicast && options.Multicast {
+				fmt.Printf("Service %s already defined without multicast. To redefine, first use skupper unexpose.", serviceName)
 				fmt.Println()
 				return
 			} else {
@@ -2032,6 +2046,10 @@ func expose(targetType string, targetName string, options ExposeOptions, kube *K
 		}
 	} else if options.Headless && targetType != "statefulset" {
 		fmt.Println("The headless option is only supported for statefulsets")
+	} else if options.Aggregate && !options.Multicast {
+		fmt.Println("The aggregate option is only supported for multicast addresses")
+	} else if options.Headless && options.Multicast {
+		fmt.Println("The headless option and multicast option are currently not compatible")
 	} else {
 		owner := get_owner_reference(router)
 		if targetType == "deployment" {
@@ -2228,9 +2246,16 @@ func listServiceDefinitions(kube *KubeDetails) {
 				fmt.Println()
 			} else if len(service.Targets) == 0 {
 				fmt.Printf("    %s (%s port %d)", service.Address, service.Protocol, service.Port)
+				if service.Multicast {
+					fmt.Printf(", multicast")
+				}
 				fmt.Println()
 			} else {
-				fmt.Printf("    %s (%s port %d) with targets", service.Address, service.Protocol, service.Port)
+				if service.Multicast {
+					fmt.Printf("    %s (%s port %d), multicast with subscriptions", service.Address, service.Protocol, service.Port)
+				} else {
+					fmt.Printf("    %s (%s port %d) with targets", service.Address, service.Protocol, service.Port)
+				}
 				fmt.Println()
 				for _, t := range service.Targets {
 					var name string
@@ -2490,11 +2515,13 @@ func main() {
 			expose(args[0], args[1], exposeOptions, initKubeConfig(namespace, context))
 		},
 	}
-	cmdExpose.Flags().StringVar(&(exposeOptions.Protocol), "protocol", "tcp", "The protocol to proxy (tcp, http, or http2)")
+	cmdExpose.Flags().StringVar(&(exposeOptions.Protocol), "protocol", "tcp", "The protocol to proxy (tcp, http or http2)")
 	cmdExpose.Flags().StringVar(&(exposeOptions.Address), "address", "", "The Skupper address to expose")
 	cmdExpose.Flags().IntVar(&(exposeOptions.Port), "port", 0, "The port to expose on")
 	cmdExpose.Flags().IntVar(&(exposeOptions.TargetPort), "target-port", 0, "The port to target on pods")
 	cmdExpose.Flags().BoolVar(&(exposeOptions.Headless), "headless", false, "Expose through a headless service (valid only for a statefulset target)")
+	cmdExpose.Flags().BoolVar(&(exposeOptions.Multicast), "multicast", false, "Route each message for this address to all targets")
+	cmdExpose.Flags().BoolVar(&(exposeOptions.Aggregate), "Aggregate", false, "Aggregate all responses for multicast requests (valid only if --multicast specified)")
 
 
 	var unexposeAddress string
