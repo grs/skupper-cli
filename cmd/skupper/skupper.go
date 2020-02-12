@@ -1134,7 +1134,7 @@ func initCommon(router *Router, volumes []string, kube *KubeDetails) *appsv1.Dep
 		ensureServiceForController("skupper-controller", metricsPort, &owner, "", "", kube)
 		ensureRoute("skupper-controller", "skupper-controller", "metrics", routev1.TLSTerminationEdge, &owner, kube)
 	} else {
-		ensureServiceForController("skupper-internal", metricsPort, &owner, "", "LoadBalancer", kube)
+		ensureServiceForController("skupper-controller", metricsPort, &owner, "", "LoadBalancer", kube)
 	}
 
 	return dep
