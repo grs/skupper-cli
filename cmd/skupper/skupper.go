@@ -1004,6 +1004,15 @@ func ensureEditRole(router *appsv1.Deployment, kube *KubeDetails) *rbacv1.Role {
 			},
 		},
 	}
+	if kube.Routes != nil {
+		role.Rules = append(role.Rules,
+			rbacv1.PolicyRule {
+				Verbs:     []string{"get"},
+				APIGroups: []string{"route.openshift.io"},
+				Resources: []string{"routes"},
+			},
+		)
+	}
 	actual, err := kube.Standard.RbacV1().Roles(kube.Namespace).Create(role)
 	if err != nil {
 		if errors.IsAlreadyExists(err) {
